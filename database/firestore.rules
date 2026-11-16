@@ -1,0 +1,448 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function projectPath(id) {
+      return /databases/$(database)/documents/projects/$(id);
+    }
+
+    function listingPath(id) {
+      return /databases/$(database)/documents/projectListings/$(id);
+    }
+
+    function counterPath(uid) {
+      return /databases/$(database)/documents/claimCounters/$(uid);
+    }
+
+    function activityPath(id) {
+      return /databases/$(database)/documents/projectActivities/$(id);
+    }
+
+    function rewardPath(id) {
+      return /databases/$(database)/documents/pointTransactions/$(id);
+    }
+
+    function activeRole(role) {
+      return request.auth != null && request.auth.token.role == role
+        && get(userPath(request.auth.uid)).data.role == role
+        && get(userPath(request.auth.uid)).data.status == 'active';
+    }
+
+    function validId(id) {
+      return id is string && id.matches('^[A-Za-z0-9_-]{1,128}$');
+    }
+
+    function fields(data, keys) {
+      return data.keys().hasOnly(keys) && data.keys().hasAll(keys);
+    }
+
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // WIB uses UTC+07:00. The date is evaluated from Firestore's request.time.
+    function jakartaDay(time) {
+      return (time + duration.value(7, 'h')).date();
+    }
+
+    function currentJakartaDay() {
+      return jakartaDay(request.time);
+    }
+
+    function validText(value, min, max) {
+      return value is string && value.size() >= min && value.size() <= max;
+    }
+
+    function auditMatches(project, id, action) {
+      let path = activityPath(project.activityId);
+      let event = getAfter(path).data;
+      return validId(project.activityId) && !exists(path)
+        && event.projectId == id && event.actorId == request.auth.uid
+        && event.action == action && event.timestamp == request.time;
+    }
+
+    function listingMatches(listing, project, id) {
+      return fields(listing, ['projectId', 'title', 'packageType', 'status', 'points',
+        'deadline', 'createdAt'])
+        && listing.projectId == id && listing.title == project.title
+        && listing.packageType == project.packageType && listing.status == 'available'
+        && listing.points == project.points && listing.deadline == project.deadline
+        && listing.createdAt == project.createdAt;
+    }
+
+    function validPublication(id) {
+      let project = request.resource.data;
+      return activeRole('owner')
+        && fields(project, ['projectId', 'title', 'packageType', 'status', 'points',
+          'deadline', 'createdAt', 'updatedAt', 'clientName', 'brief',
+          'assignedWorkerId', 'createdBy', 'activityId'])
+        && project.projectId == id && project.createdBy == request.auth.uid
+        && validText(project.title, 1, 160) && validText(project.clientName, 1, 160)
+        && validText(project.brief, 0, 4000)
+        && project.packageType in ['Basic', 'Full Setup', 'Premium']
+        && project.status == 'available' && project.assignedWorkerId == null
+        && project.points is int && project.points == 100
+        && project.createdAt == request.time && project.updatedAt == request.time
+        && project.deadline is timestamp
+        && project.deadline > request.time
+        && project.deadline <= request.time + duration.value(366, 'd')
+        && listingMatches(getAfter(listingPath(id)).data, project, id)
+        && auditMatches(project, id, 'published');
+    }
+
+    function projectClaimedBy(uid, id) {
+      let path = projectPath(id);
+      let before = get(path).data;
+      let after = getAfter(path).data;
+      return before.status == 'available' && before.assignedWorkerId == null
+        && after.status == 'claimed' && after.assignedWorkerId == uid
+        && after.claimedAt == request.time && after.updatedAt == request.time;
+    }
+
+    function validClaim(id) {
+      let uid = request.auth.uid;
+      let project = request.resource.data;
+      let counter = getAfter(counterPath(uid)).data;
+      return resource.data.status == 'available' && resource.data.assignedWorkerId == null
+        && project.status == 'claimed' && project.assignedWorkerId == uid
+        && project.assignedWorkerName == get(userPath(uid)).data.name
+        && project.claimedAt == request.time && project.updatedAt == request.time
+        && onlyChanges(['status', 'assignedWorkerId', 'assignedWorkerName',
+          'claimedAt', 'updatedAt', 'activityId'])
+        && counter.lastProjectId == id && counter.updatedAt == request.time
+        && exists(listingPath(id)) && !existsAfter(listingPath(id))
+        && auditMatches(project, id, 'claimed');
+    }
+
+    function validCounter(uid, expectedCount) {
+      let counter = request.resource.data;
+      return fields(counter, ['workerId', 'lastProjectId', 'claimCount', 'updatedAt'])
+        && counter.workerId == uid && validId(counter.lastProjectId)
+        && counter.claimCount is int && counter.claimCount == expectedCount
+        && counter.claimCount >= 1 && counter.claimCount <= 3
+        && counter.updatedAt == request.time && projectClaimedBy(uid, counter.lastProjectId);
+    }
+
+    function waiting(status) {
+      return status in ['waitingReview', 'waiting_review'];
+    }
+
+    function validProgress(id) {
+      let before = resource.data.status;
+      let after = request.resource.data;
+      return resource.data.assignedWorkerId == request.auth.uid
+        && ((before in ['claimed', 'revision', 'revision_required'] && after.status == 'working'
+            || before == 'working' && after.status == 'almostDone')
+          && onlyChanges(['status', 'updatedAt', 'activityId'])
+          || before in ['almostDone', 'revision', 'revision_required']
+            && after.status == 'waiting_review'
+            && onlyChanges(['status', 'updatedAt', 'activityId', 'submittedAt'])
+            && after.submittedAt == request.time)
+        && after.updatedAt == request.time
+        && auditMatches(after, id, after.status);
+    }
+
+    function canReadProject(id) {
+      return activeRole('owner') || (activeRole('worker')
+        && get(projectPath(id)).data.assignedWorkerId == request.auth.uid);
+    }
+
+    function https(value) {
+      return validText(value, 9, 1000)
+        && value.matches('https://[a-zA-Z0-9-]+([.][a-zA-Z0-9-]+)+([/?#][a-zA-Z0-9._~!$&()*+,;=:@%/?#-]*)?');
+    }
+
+    function validSubmission(data) {
+      return fields(data, ['notes', 'discordUrl', 'proofUrl'])
+        && validText(data.notes, 1, 4000) && data.notes.matches('(?s).*[^[:space:]].*')
+        && validText(data.discordUrl, 1, 300)
+        && data.discordUrl.matches('https://(discord[.]gg/|discord[.]com/invite/)[a-zA-Z0-9_-]{2,100}/?')
+        && (data.proofUrl == null || https(data.proofUrl));
+    }
+
+    function attachmentPath(id) {
+      return /databases/$(database)/documents/revisionImages/$(id);
+    }
+
+    function validRevision(data, id, project) {
+      return fields(data, ['title', 'description', 'deadline', 'imageCount'])
+        && validText(data.title, 1, 160) && data.title.matches('.*[^[:space:]].*')
+        && validText(data.description, 1, 4000) && data.description.matches('(?s).*[^[:space:]].*')
+        && (data.deadline == null || (data.deadline is timestamp && data.deadline > request.time
+          && data.deadline <= request.time + duration.value(366, 'd')))
+        && data.deadline == project.get('revisionDeadline', null)
+        && data.imageCount is int && data.imageCount >= 0 && data.imageCount <= 2
+        && (data.imageCount == 0 || getAfter(attachmentPath(id)).data.images.size() == data.imageCount);
+    }
+
+    function validImage(value) {
+      return value is bytes && value.size() >= 16 && value.size() <= 150000
+        && value.toHexString().matches('FFD8FF[0-9A-F]*FFD9');
+    }
+
+    function validImages(id) {
+      let data = request.resource.data;
+      let path = activityPath(id);
+      let event = getAfter(path).data;
+      return fields(data, ['encoding', 'images'])
+        && data.encoding == 'image/jpeg' && data.images is list
+        && data.images.size() in [1, 2] && validImage(data.images[0])
+        && (data.images.size() == 1 || validImage(data.images[1]))
+        && !exists(path) && event.action == 'revision_required' && event.actorId == request.auth.uid
+        && event.timestamp == request.time && event.detail.imageCount == data.images.size();
+    }
+
+    function approvalReward(id, project) {
+      let path = rewardPath(id);
+      let reward = getAfter(path).data;
+      return !exists(path) && reward.projectId == id
+        && reward.workerId == project.assignedWorkerId
+        && reward.points == project.points && reward.createdAt == request.time;
+    }
+
+    function validReview(id) {
+      let project = request.resource.data;
+      return waiting(resource.data.status) && validId(project.assignedWorkerId)
+        && project.updatedAt == request.time
+        && ((project.status == 'revision_required'
+            && onlyChanges(['status', 'updatedAt', 'activityId', 'revisionDeadline']))
+          || (project.status == 'completed'
+            && onlyChanges(['status', 'updatedAt', 'activityId', 'submittedAt'])
+            && project.submittedAt == resource.data.get('submittedAt', resource.data.updatedAt)
+            && approvalReward(id, project) && scoreMatches(id, project)))
+        && auditMatches(project, id, project.status);
+    }
+
+    function validReward(id) {
+      let reward = request.resource.data;
+      let before = get(projectPath(id)).data;
+      let after = getAfter(projectPath(id)).data;
+      let workerBefore = get(userPath(reward.workerId)).data;
+      let workerAfter = getAfter(userPath(reward.workerId)).data;
+      return fields(reward, ['projectId', 'workerId', 'points', 'reason', 'createdAt'])
+        && reward.projectId == id && reward.workerId == before.assignedWorkerId
+        && waiting(before.status) && after.status == 'completed'
+        && after.updatedAt == request.time && reward.points == before.points
+        && reward.points is int && reward.points > 0
+        && reward.reason == 'project_approved' && reward.createdAt == request.time
+        && workerBefore.role == 'worker' && workerBefore.points is int
+        && workerAfter.lastRewardProjectId == id
+        && workerAfter.points == workerBefore.points + reward.points;
+    }
+
+    function validBalanceCredit(uid) {
+      let after = request.resource.data;
+      let path = rewardPath(after.lastRewardProjectId);
+      let reward = getAfter(path).data;
+      return validId(after.lastRewardProjectId) && resource.data.role == 'worker'
+        && onlyChanges(['points', 'lastRewardProjectId'])
+        && !exists(path) && reward.workerId == uid && reward.createdAt == request.time
+        && reward.points is int && reward.points > 0
+        && resource.data.points is int && after.points is int
+        && after.points == resource.data.points + reward.points;
+    }
+
+    function checklistPath(id, item) {
+      return /databases/$(database)/documents/projects/$(id)/checklist/$(item);
+    }
+
+    function validChecklist(id, item) {
+      let data = request.resource.data;
+      let eventPath = activityPath(data.activityId);
+      let event = getAfter(eventPath).data;
+      return onlyChanges(['done', 'updatedAt', 'activityId'])
+        && resource.data.done == false && data.done == true
+        && !(get(projectPath(id)).data.status in ['completed', 'waiting_review', 'waitingReview'])
+        && data.updatedAt == request.time && validId(data.activityId) && !exists(eventPath)
+        && event.action == 'checklist_done' && event.projectId == id && event.actorId == request.auth.uid
+        && event.timestamp == request.time && event.detail.itemId == item;
+    }
+
+    function activityDetail(event, eventId, project) {
+      return event.action == 'waiting_review' ? validSubmission(event.detail)
+        : event.action == 'revision_required' ? validRevision(event.detail, eventId, project)
+        : !event.keys().hasAny(['detail']);
+    }
+
+    function validActivity(eventId) {
+      let event = request.resource.data;
+      let path = projectPath(event.projectId);
+      let project = getAfter(path).data;
+      return event.keys().hasOnly(['projectId', 'actorId', 'action', 'timestamp', 'detail'])
+        && validId(event.projectId) && event.actorId == request.auth.uid && event.timestamp == request.time
+        && (event.action == 'checklist_done'
+          ? validChecklistActivity(event, eventId)
+          : project.updatedAt == request.time && project.activityId == eventId
+            && (!exists(path) || get(path).data.get('activityId', '') != eventId)
+            && event.action == (project.status == 'available' ? 'published' : project.status)
+            && activityDetail(event, eventId, project));
+    }
+
+    function validChecklistActivity(event, eventId) {
+      let itemId = event.detail.itemId;
+      let path = checklistPath(event.projectId, itemId);
+      let item = getAfter(path).data;
+      return fields(event.detail, ['itemId', 'title']) && validId(itemId)
+        && get(path).data.done == false && item.done == true && item.activityId == eventId
+        && item.updatedAt == request.time && event.detail.title == item.title;
+    }
+
+    function scorePath(uid) {
+      return /databases/$(database)/documents/workerScores/$(uid);
+    }
+
+    function scoreDelta(project, profile, before, after) {
+      let deadline = project.get('revisionDeadline', null);
+      let submitted = project.get('submittedAt', project.updatedAt);
+      return fields(after, ['name', 'points', 'completed', 'onTime', 'updatedAt'])
+        && after.name == profile.name && after.points == profile.points + project.points
+        && after.completed is int && after.completed == before.completed + 1
+        && after.onTime is int
+        && after.onTime == before.onTime + (submitted <= (deadline == null ? project.deadline : deadline) ? 1 : 0)
+        && after.updatedAt == request.time;
+    }
+
+    function scoreMatches(id, project) {
+      let path = scorePath(project.assignedWorkerId);
+      return getAfter(path).data.updatedAt == request.time
+        && getAfter(userPath(project.assignedWorkerId)).data.lastRewardProjectId == id;
+    }
+
+    function validScore(uid, before) {
+      let score = request.resource.data;
+      let id = getAfter(userPath(uid)).data.lastRewardProjectId;
+      let path = projectPath(id);
+      let project = get(path).data;
+      let profile = get(userPath(uid)).data;
+      return validId(id) && profile.role == 'worker' && before.points == profile.points
+        && project.assignedWorkerId == uid && waiting(project.status)
+        && getAfter(path).data.status == 'completed' && getAfter(path).data.updatedAt == request.time
+        && scoreDelta(project, profile, before, score);
+    }
+
+    function messagePath(id, message) {
+      return /databases/$(database)/documents/projects/$(id)/messages/$(message);
+    }
+
+    function chatClockPath(id, uid) {
+      return /databases/$(database)/documents/projects/$(id)/chatClocks/$(uid);
+    }
+
+    function validMessage(id, message) {
+      let data = request.resource.data;
+      let clock = getAfter(chatClockPath(id, request.auth.uid)).data;
+      let project = get(projectPath(id)).data;
+      return project.assignedWorkerId is string
+        && fields(data, ['authorId', 'authorName', 'text', 'timestamp'])
+        && data.authorId == request.auth.uid && data.authorName == get(userPath(request.auth.uid)).data.name
+        && validText(data.text, 1, 1000) && data.text.matches('(?s).*[^[:space:]].*')
+        && data.timestamp == request.time && clock.at == request.time && clock.messageId == message;
+    }
+
+    function validChatClock(id, uid) {
+      let data = request.resource.data;
+      let path = messagePath(id, data.messageId);
+      let message = getAfter(path).data;
+      return fields(data, ['at', 'messageId']) && data.at == request.time
+        && validId(data.messageId) && !exists(path)
+        && message.authorId == uid && message.timestamp == request.time;
+    }
+
+    match /users/{uid} {
+      allow get: if activeRole('owner') || (activeRole('worker') && request.auth.uid == uid);
+      allow list: if activeRole('owner');
+      allow update: if activeRole('owner') && validBalanceCredit(uid);
+    }
+
+    match /projects/{id} {
+      allow read: if activeRole('owner')
+        || (activeRole('worker') && resource.data.assignedWorkerId == request.auth.uid);
+      allow create: if validId(id) && validPublication(id);
+      allow update: if (activeRole('worker') && (validClaim(id) || validProgress(id)))
+        || (activeRole('owner') && validReview(id));
+    }
+
+    match /projectListings/{id} {
+      allow read: if activeRole('worker');
+      allow create: if activeRole('owner') && !exists(projectPath(id))
+        && getAfter(projectPath(id)).data.createdBy == request.auth.uid
+        && listingMatches(request.resource.data, getAfter(projectPath(id)).data, id);
+      allow delete: if activeRole('worker') && projectClaimedBy(request.auth.uid, id);
+    }
+
+    match /claimCounters/{uid} {
+      allow get: if activeRole('worker') && request.auth.uid == uid;
+      allow create: if activeRole('worker') && request.auth.uid == uid && validCounter(uid, 1);
+      allow update: if activeRole('worker') && request.auth.uid == uid
+        && resource.data.updatedAt is timestamp && resource.data.updatedAt <= request.time
+        && resource.data.claimCount is int
+        && resource.data.claimCount >= 1 && resource.data.claimCount <= 3
+        && validCounter(uid, jakartaDay(resource.data.updatedAt) == currentJakartaDay()
+          ? resource.data.claimCount + 1 : 1);
+    }
+
+    match /projectActivities/{id} {
+      allow read: if canReadProject(resource.data.projectId);
+      // The project or checklist write must independently authorize the actor.
+      allow create: if request.auth != null && validId(id) && validActivity(id);
+    }
+
+    match /revisionImages/{id} {
+      allow get: if canReadProject(get(activityPath(id)).data.projectId);
+      allow create: if activeRole('owner') && validImages(id);
+    }
+
+    match /projects/{id}/checklist/{item} {
+      allow read: if canReadProject(id);
+      allow create: if activeRole('owner') && validId(item) && exists(projectPath(id))
+        && get(projectPath(id)).data.status != 'completed'
+        && fields(request.resource.data, ['title', 'done', 'updatedAt'])
+        && validText(request.resource.data.title, 1, 160)
+        && request.resource.data.title.matches('.*[^[:space:]].*')
+        && request.resource.data.done == false && request.resource.data.updatedAt == request.time;
+      allow update: if (activeRole('owner') && get(projectPath(id)).data.status != 'completed'
+          && resource.data.done == false && onlyChanges(['title', 'updatedAt'])
+          && validText(request.resource.data.title, 1, 160) && request.resource.data.title.matches('.*[^[:space:]].*')
+          && request.resource.data.updatedAt == request.time)
+        || (activeRole('worker') && get(projectPath(id)).data.assignedWorkerId == request.auth.uid
+          && validChecklist(id, item));
+      allow delete: if activeRole('owner') && get(projectPath(id)).data.status != 'completed'
+        && resource.data.done == false;
+    }
+
+    match /projects/{id}/messages/{message} {
+      allow read: if canReadProject(id);
+      allow create: if canReadProject(id) && validId(message) && validMessage(id, message);
+    }
+
+    match /projects/{id}/chatClocks/{uid} {
+      allow create: if request.auth != null && request.auth.uid == uid
+        && canReadProject(id) && validChatClock(id, uid);
+      allow update: if request.auth != null && request.auth.uid == uid && canReadProject(id)
+        && request.time >= resource.data.at + duration.value(3, 's') && validChatClock(id, uid);
+    }
+
+    match /workerScores/{uid} {
+      allow read: if activeRole('owner') || activeRole('worker');
+      allow create: if activeRole('owner') && validScore(uid, {'points': 0, 'completed': 0, 'onTime': 0});
+      allow update: if activeRole('owner') && validScore(uid, resource.data);
+    }
+
+    match /pointTransactions/{id} {
+      allow read: if activeRole('owner')
+        || (activeRole('worker') && resource.data.workerId == request.auth.uid);
+      allow create: if activeRole('owner') && validReward(id);
+    }
+
+    match /serverClocks/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid
+        && (activeRole('worker') || activeRole('owner'));
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && (activeRole('worker') || activeRole('owner'))
+        && fields(request.resource.data, ['at']) && request.resource.data.at == request.time;
+    }
+  }
+}

@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!firebase.emulator.json
+!database/
+!database/firestore.rules
+!database/firestore.indexes.json
